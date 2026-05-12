@@ -54,9 +54,11 @@ local function buildOverlay()
   -- top-right of primary screen, just under menu bar so it sits near the
   -- mac mic/camera indicator zone. fullScreenAuxiliary lets it ride along
   -- into fullscreen spaces.
+  -- mac mic/cam indicator occupies ~24px at the top-right corner; offset
+  -- our overlay further left so the two never overlap in fullscreen.
   local frame = hs.screen.primaryScreen():fullFrame()
   local w, h = 44, 14
-  local x = frame.x + frame.w - w - 8
+  local x = frame.x + frame.w - w - 36
   local y = frame.y + 4
 
   overlay = hs.canvas.new({ x = x, y = y, w = w, h = h })
