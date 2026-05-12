@@ -18,6 +18,9 @@ local menubarReview
 local menubarBlocked
 local watcher
 local debounceTimer
+local visibilityTimer
+local syncTimer
+local overlayHidden = false
 
 local function readState()
   local hasReview, hasBlocked = false, false
@@ -37,6 +40,16 @@ local function readState()
   return hasReview, hasBlocked
 end
 
+local function slotElement(fillColor, cx, visible)
+  return {
+    type = "circle",
+    action = visible and "fill" or "skip",
+    fillColor = fillColor,
+    center = { x = cx, y = 7 },
+    radius = 5,
+  }
+end
+
 local function buildOverlay()
   -- top-right of primary screen, just under menu bar so it sits near the
   -- mac mic/camera indicator zone. fullScreenAuxiliary lets it ride along
@@ -51,25 +64,11 @@ local function buildOverlay()
   overlay:behavior({ "canJoinAllSpaces", "stationary", "fullScreenAuxiliary" })
   overlay:clickActivating(false)
 
-  -- two slots; alpha toggled to show/hide
-  overlay[1] = {
-    type = "circle", action = "fill",
-    fillColor = REVIEW_COLOR,
-    center = { x = 11, y = 7 }, radius = 5,
-  }
-  overlay[2] = {
-    type = "circle", action = "fill",
-    fillColor = BLOCKED_COLOR,
-    center = { x = 33, y = 7 }, radius = 5,
-  }
-  overlay[1].action = "skip"
-  overlay[2].action = "skip"
+  overlay:replaceElements({
+    slotElement(REVIEW_COLOR,  11, false),
+    slotElement(BLOCKED_COLOR, 33, false),
+  })
   overlay:show()
-end
-
-local function setSlot(idx, visible)
-  if not overlay then return end
-  overlay[idx].action = visible and "fill" or "skip"
 end
 
 local function ensureMenubar()
@@ -89,11 +88,39 @@ end
 
 local function render()
   local r, b = readState()
-  setSlot(1, r)
-  setSlot(2, b)
+  if overlay then
+    overlay:replaceElements({
+      slotElement(REVIEW_COLOR,  11, r),
+      slotElement(BLOCKED_COLOR, 33, b),
+    })
+  end
   ensureMenubar()
   setMenubar(menubarReview,  r, "🟢", "Claude Code: ready for review")
   setMenubar(menubarBlocked, b, "🔴", "Claude Code: waiting on you")
+end
+
+local function updateOverlayVisibility()
+  if not overlay then return end
+  local screen = hs.screen.primaryScreen()
+  local screenFrame = screen:fullFrame()
+  local spaceID = hs.spaces.focusedSpace()
+  local spaceType = spaceID and hs.spaces.spaceType(spaceID) or "user"
+  local menubarVisible
+  if spaceType ~= "fullscreen" then
+    -- normal desktop space: menubar always present
+    menubarVisible = true
+  else
+    -- fullscreen space: menubar auto-hides, revealed only when cursor near top
+    local m = hs.mouse.absolutePosition() or hs.mouse.getAbsolutePosition()
+    menubarVisible = m.y <= screenFrame.y + 30
+  end
+  if menubarVisible and not overlayHidden then
+    overlay:hide()
+    overlayHidden = true
+  elseif not menubarVisible and overlayHidden then
+    overlay:show()
+    overlayHidden = false
+  end
 end
 
 local function scheduleRender()
@@ -107,10 +134,14 @@ function M.start()
   ensureMenubar()
   render()
   watcher = hs.pathwatcher.new(STATE_DIR, scheduleRender):start()
+  visibilityTimer = hs.timer.doEvery(0.2, updateOverlayVisibility):start()
+  syncTimer = hs.timer.doEvery(1.0, render):start()
 end
 
 function M.stop()
   if watcher then watcher:stop(); watcher = nil end
+  if visibilityTimer then visibilityTimer:stop(); visibilityTimer = nil end
+  if syncTimer then syncTimer:stop(); syncTimer = nil end
   if overlay then overlay:delete(); overlay = nil end
   if menubarReview then menubarReview:delete(); menubarReview = nil end
   if menubarBlocked then menubarBlocked:delete(); menubarBlocked = nil end
