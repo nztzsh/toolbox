@@ -22,6 +22,6 @@ if [ ! -d "$PROJECT_DIR/.git" ] && ! git -C "$PROJECT_DIR" rev-parse --git-dir >
   exit 0
 fi
 
-# DiffviewOpen with no ref = HEAD vs working tree. default_args in
-# diffview config adds --untracked-files=true so new files appear too.
-open_terminal_tab "$PROJECT_DIR" "nvim +'DiffviewOpen'"
+# :Review loads all changed + untracked files vs HEAD into arglist,
+# opens first file in single pane with gitsigns inline diff markers.
+open_terminal_tab "$PROJECT_DIR" "nvim +Review"
