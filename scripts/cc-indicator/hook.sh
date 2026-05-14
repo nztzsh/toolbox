@@ -38,20 +38,26 @@ write_state() {
   mv -f "$file.tmp" "$file"
 }
 
-# Suppression: clear.sh drops a sentinel so the next matching write from this
-# turn is skipped. Without this, running /cc-clear-review immediately triggers
-# Stop, which re-writes the review state we just cleared. Sentinel is consumed
-# on use (removed after one skip) and has a 60s TTL as a safety net.
+# Suppression: clear.sh drops a sentinel so subsequent matching writes are
+# skipped until the user takes a new action.
+#
+# Two sentinel types with different consumption rules:
+#   - suppress-review: consumed once by Stop (Stop fires once per turn).
+#   - suppress-blocked: persistent, since Notification fires repeatedly while
+#     idle. Cleared on the *next* UserPromptSubmit, with a grace window so a
+#     UserPromptSubmit firing immediately after clear.sh (e.g. when a slash
+#     command's `!bash` expansion sets the sentinel) does not wipe it before
+#     the suppressed event arrives.
+SUPPRESS_GRACE_SECS=5
+
 suppress_active() {
-  local marker="$dir/.suppress-$1"
-  [ -f "$marker" ] || return 1
-  local age=$(( $(date +%s) - $(stat -f %m "$marker" 2>/dev/null || echo 0) ))
-  if [ "$age" -gt 60 ]; then
-    rm -f "$marker"
-    return 1
-  fi
-  rm -f "$marker"
-  return 0
+  [ -f "$dir/.suppress-$1" ]
+}
+
+suppress_age() {
+  local m="$dir/.suppress-$1"
+  [ -f "$m" ] || { echo -1; return; }
+  echo $(( $(date +%s) - $(stat -f %m "$m" 2>/dev/null || echo 0) ))
 }
 
 case "$event" in
@@ -62,15 +68,32 @@ case "$event" in
   Stop)
     # assistant finished its turn — ready for review.
     # always wins over any prior blocked state (approval was resolved if
-    # the turn reached Stop).
-    suppress_active review && { rm -f "$file"; exit 0; }
+    # the turn reached Stop). Consume the sentinel after use.
+    if suppress_active review; then
+      rm -f "$file" "$dir/.suppress-review"
+      exit 0
+    fi
     write_state review
     ;;
-  UserPromptSubmit|PreToolUse|PostToolUse)
+  UserPromptSubmit)
+    # New user turn — clear state. Clear suppression sentinels only if
+    # they are older than the grace window; a freshly-set sentinel (from a
+    # slash command's `!bash` expansion in this very prompt) must survive
+    # so the upcoming Stop/Notification can honor it.
+    rm -f "$file"
+    age=$(suppress_age review)
+    [ "$age" -ge 0 ] && [ "$age" -gt "$SUPPRESS_GRACE_SECS" ] && rm -f "$dir/.suppress-review"
+    age=$(suppress_age blocked)
+    [ "$age" -ge 0 ] && [ "$age" -gt "$SUPPRESS_GRACE_SECS" ] && rm -f "$dir/.suppress-blocked"
+    ;;
+  PreToolUse|PostToolUse)
+    # Mid-turn tool activity — clear state only. Do NOT touch suppress
+    # sentinels: clear.sh may run inside a Bash tool call, so wiping the
+    # sentinel here would erase the suppression it just set.
     rm -f "$file"
     ;;
   SessionEnd)
-    rm -f "$file"
+    rm -f "$file" "$dir/.suppress-review" "$dir/.suppress-blocked"
     ;;
 esac
 
