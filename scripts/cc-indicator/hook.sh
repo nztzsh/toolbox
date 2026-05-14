@@ -38,14 +38,32 @@ write_state() {
   mv -f "$file.tmp" "$file"
 }
 
+# Suppression: clear.sh drops a sentinel so the next matching write from this
+# turn is skipped. Without this, running /cc-clear-review immediately triggers
+# Stop, which re-writes the review state we just cleared. Sentinel is consumed
+# on use (removed after one skip) and has a 60s TTL as a safety net.
+suppress_active() {
+  local marker="$dir/.suppress-$1"
+  [ -f "$marker" ] || return 1
+  local age=$(( $(date +%s) - $(stat -f %m "$marker" 2>/dev/null || echo 0) ))
+  if [ "$age" -gt 60 ]; then
+    rm -f "$marker"
+    return 1
+  fi
+  rm -f "$marker"
+  return 0
+}
+
 case "$event" in
   Notification)
+    suppress_active blocked && exit 0
     write_state blocked
     ;;
   Stop)
     # assistant finished its turn — ready for review.
     # always wins over any prior blocked state (approval was resolved if
     # the turn reached Stop).
+    suppress_active review && { rm -f "$file"; exit 0; }
     write_state review
     ;;
   UserPromptSubmit|PreToolUse|PostToolUse)
