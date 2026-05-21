@@ -13,6 +13,7 @@ import shutil
 import signal
 import sys
 import time
+import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -27,6 +28,44 @@ from daemon.state import STATE  # noqa: E402
 
 FPS = 25
 FRAME_DT = 1.0 / FPS
+
+LOG_PATH = os.path.expanduser("~/.cache/dancing-claude/dance.log")
+LOG_MAX_BYTES = 256 * 1024  # truncate if larger at startup
+AUDIO_CHECK_INTERVAL = 5.0   # seconds between stream health checks
+ERROR_BACKOFF = 0.25         # sleep this long after a caught exception
+ERROR_LOG_MIN_INTERVAL = 2.0  # rate-limit identical errors to avoid log spam
+
+
+def _setup_logging() -> None:
+    """Redirect stderr to a rotating-ish log file so post-mortem is possible.
+
+    Without this, any exception printed to stderr dies with the pane and we
+    have nothing to debug from.
+    """
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+            # naive truncate — keep the tail
+            with open(LOG_PATH, "rb") as f:
+                f.seek(-LOG_MAX_BYTES // 2, os.SEEK_END)
+                tail = f.read()
+            with open(LOG_PATH, "wb") as f:
+                f.write(b"--- log truncated ---\n")
+                f.write(tail)
+        log_fp = open(LOG_PATH, "ab", buffering=0)
+        os.dup2(log_fp.fileno(), 2)
+        sys.stderr.write(f"\n=== dance.py start pid={os.getpid()} t={time.time():.0f} ===\n")
+    except Exception:
+        # never let logging break startup
+        pass
+
+
+def _log_exc(tag: str, exc: BaseException) -> None:
+    try:
+        sys.stderr.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {tag}: {exc!r}\n")
+        traceback.print_exc(file=sys.stderr)
+    except Exception:
+        pass
 
 
 def pane_size() -> tuple[int, int]:
@@ -45,7 +84,29 @@ def leave_alt_screen() -> None:
     sys.stdout.flush()
 
 
+def _try_start_audio() -> "AudioSource | None":
+    try:
+        a = AudioSource()
+        a.start()
+        sys.stderr.write(f"[dance] audio: {a.device_info()}\n")
+        return a
+    except Exception as e:  # noqa: BLE001
+        _log_exc("audio start failed", e)
+        return None
+
+
+def _audio_alive(audio: "AudioSource | None") -> bool:
+    if audio is None or audio._stream is None:
+        return False
+    try:
+        return bool(audio._stream.active)
+    except Exception:
+        return False
+
+
 def main() -> int:
+    _setup_logging()
+
     cols, rows = pane_size()
     canvas_w = max(20, cols)
     canvas_h = max(2, rows * 2)
@@ -56,14 +117,7 @@ def main() -> int:
     canvas = Canvas(canvas_w, canvas_h)
     choreo = Choreographer(lib, canvas_w, canvas_h)
 
-    audio = None
-    try:
-        audio = AudioSource()
-        audio.start()
-        sys.stderr.write(f"[dance] audio: {audio.device_info()}\n")
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"[dance] no audio: {e}\n")
-
+    audio = _try_start_audio()
     detector = BeatDetector()
 
     enter_alt_screen()
@@ -75,54 +129,93 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGHUP, shutdown)
+    # Note: SIGHUP intentionally NOT trapped — tmux does not normally send it,
+    # but some macOS sleep/wake or terminal hand-offs can. Letting it default
+    # to SIG_IGN keeps the pane alive across those events.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     last = time.monotonic()
+    last_audio_check = 0.0
+    last_err_t = 0.0
+    last_err_repr = ""
     try:
         while not stopping["flag"]:
-            now = time.monotonic()
-            dt = now - last
-            last = now
+            try:
+                now = time.monotonic()
+                dt = now - last
+                last = now
 
-            # resize check — recreate canvas if pane changed
-            cur_cols, cur_rows = pane_size()
-            new_w = max(20, cur_cols)
-            new_h = max(2, cur_rows * 2)
-            if new_h % 2 != 0:
-                new_h += 1
-            if new_w != canvas.width or new_h != canvas.height:
-                canvas = Canvas(new_w, new_h)
-                choreo.canvas_w = new_w
-                choreo.canvas_h = new_h
-                sys.stdout.write("\x1b[2J")
+                # periodic audio health check — restart silently if stream died
+                if now - last_audio_check > AUDIO_CHECK_INTERVAL:
+                    last_audio_check = now
+                    if not _audio_alive(audio):
+                        if audio is not None:
+                            try:
+                                audio.stop()
+                            except Exception:
+                                pass
+                        audio = _try_start_audio()
 
-            if audio is not None:
-                for _ in range(12):
-                    block = audio.pop_block()
-                    if block is None:
-                        break
-                    detector.process(block, STATE.record_beat)
+                # resize check — recreate canvas if pane changed
+                cur_cols, cur_rows = pane_size()
+                new_w = max(20, cur_cols)
+                new_h = max(2, cur_rows * 2)
+                if new_h % 2 != 0:
+                    new_h += 1
+                if new_w != canvas.width or new_h != canvas.height:
+                    canvas = Canvas(new_w, new_h)
+                    choreo.canvas_w = new_w
+                    choreo.canvas_h = new_h
+                    sys.stdout.write("\x1b[2J")
 
-            bpm = detector.estimate_bpm()
-            choreo.maybe_reload_moves(now)
-            choreo.refresh_move(bpm)
-            choreo.handle_beats()
-            choreo.step_particles(dt)
-            choreo.render(canvas, bpm, detector.last_rms, now)
+                if audio is not None:
+                    for _ in range(12):
+                        block = audio.pop_block()
+                        if block is None:
+                            break
+                        detector.process(block, STATE.record_beat)
 
-            frame = canvas.render_ansi()
-            sys.stdout.write("\x1b[H" + frame)
-            sys.stdout.flush()
+                bpm = detector.estimate_bpm()
+                choreo.maybe_reload_moves(now)
+                choreo.refresh_move(bpm)
+                choreo.handle_beats()
+                choreo.step_particles(dt)
+                choreo.render(canvas, bpm, detector.last_rms, now)
 
-            # frame pacing
-            elapsed = time.monotonic() - now
-            sleep_for = FRAME_DT - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+                frame = canvas.render_ansi()
+                try:
+                    sys.stdout.write("\x1b[H" + frame)
+                    sys.stdout.flush()
+                except (BrokenPipeError, OSError) as e:
+                    # tty briefly unavailable (e.g. tmux re-layout) — back off
+                    _log_exc("stdout write failed", e)
+                    time.sleep(ERROR_BACKOFF)
+                    continue
+
+                # frame pacing
+                elapsed = time.monotonic() - now
+                sleep_for = FRAME_DT - elapsed
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+            except KeyboardInterrupt:
+                stopping["flag"] = True
+            except Exception as e:  # noqa: BLE001
+                # never let a single bad frame kill the pane
+                er = repr(e)
+                tnow = time.monotonic()
+                if er != last_err_repr or (tnow - last_err_t) > ERROR_LOG_MIN_INTERVAL:
+                    _log_exc("loop iteration error", e)
+                    last_err_t = tnow
+                    last_err_repr = er
+                time.sleep(ERROR_BACKOFF)
     finally:
         leave_alt_screen()
         if audio is not None:
-            audio.stop()
+            try:
+                audio.stop()
+            except Exception as e:  # noqa: BLE001
+                _log_exc("audio stop failed", e)
+        sys.stderr.write(f"=== dance.py exit pid={os.getpid()} t={time.time():.0f} ===\n")
     return 0
 
 
