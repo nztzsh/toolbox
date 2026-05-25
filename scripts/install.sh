@@ -13,6 +13,7 @@ TOOLBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LINKS=(
   "dotfiles/nvim::$HOME/.config/nvim"
   "dotfiles/hammerspoon::$HOME/.hammerspoon"
+  "dotfiles/tmux/tmux.conf::$HOME/.tmux.conf"
   "claude/commands::$HOME/.claude/commands"
 )
 
@@ -114,7 +115,27 @@ if command -v jq >/dev/null 2>&1 && [ -f "$CC_HOOK" ]; then
   echo "ok:   cc-indicator hooks registered in $SETTINGS"
 fi
 
-# ---- 4. start / reload Hammerspoon ------------------------------------------
+# ---- 4. iTerm globals (so the tmux-keymap preset actually works) ------------
+#
+# iTerm's "⌘+Number switches tabs" and "⌘+Number+Option switches windows"
+# defaults intercept Cmd-1..9 and Cmd-Opt-arrows BEFORE the profile key map
+# fires, which silently breaks dotfiles/iterm/tmux-keymap.itermkeymap. Set
+# both to "No Modifier" (tag 9 = kPreferenceModifierTagNone). Idempotent.
+
+if is_macos; then
+  for key in SwitchTabModifier SwitchWindowModifier; do
+    current="$(defaults read com.googlecode.iterm2 "$key" 2>/dev/null || echo "")"
+    if [ "$current" = "9" ]; then
+      echo "ok:   iterm $key already disabled"
+    else
+      defaults write com.googlecode.iterm2 "$key" -int 9
+      echo "set:  iterm $key -> 9 (no modifier; was: ${current:-default})"
+    fi
+  done
+  echo "      (restart iTerm for these to take effect)"
+fi
+
+# ---- 5. start / reload Hammerspoon ------------------------------------------
 
 if is_macos && [ -d /Applications/Hammerspoon.app ]; then
   if pgrep -x Hammerspoon >/dev/null 2>&1; then
@@ -153,7 +174,11 @@ fi
 
 echo
 echo "done. next steps:"
-echo "  - install deps:  brew install neovim ripgrep fd"
+echo "  - install deps:  brew install neovim ripgrep fd tmux"
 echo "  - launch nvim:   nvim   (vim.pack bootstraps plugins on first run)"
 echo "  - test review:   bash $TOOLBOX_DIR/scripts/review-nvim.sh"
 echo "  - cc-indicator:  state dir = $HOME/.claude/cc-indicator/sessions"
+echo "  - iTerm keymap:  import $TOOLBOX_DIR/dotfiles/iterm/tmux-keymap.itermkeymap"
+echo "                   (Settings → Profiles → Keys → Key Mappings → Presets… → Import)"
+echo "  - reload tmux:   tmux source-file ~/.tmux.conf   (or restart server)"
+echo "  - dancing-claude: bash $TOOLBOX_DIR/dancing-claude/setup/install.sh   (one-time venv)"
