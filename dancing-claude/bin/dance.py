@@ -29,7 +29,9 @@ from daemon.state import STATE  # noqa: E402
 FPS = 25
 FRAME_DT = 1.0 / FPS
 
-LOG_PATH = os.path.expanduser("~/.cache/dancing-claude/dance.log")
+STATE_DIR = os.path.expanduser("~/.cache/dancing-claude")
+FRAME_PATH = os.path.join(STATE_DIR, "frame.ansi")
+LOG_PATH = os.path.join(STATE_DIR, "dance.log")
 LOG_MAX_BYTES = 256 * 1024  # truncate if larger at startup
 AUDIO_CHECK_INTERVAL = 5.0   # seconds between stream health checks
 ERROR_BACKOFF = 0.25         # sleep this long after a caught exception
@@ -57,6 +59,23 @@ def _setup_logging() -> None:
         sys.stderr.write(f"\n=== dance.py start pid={os.getpid()} t={time.time():.0f} ===\n")
     except Exception:
         # never let logging break startup
+        pass
+
+
+def _mirror_frame(payload: str) -> None:
+    """Write the latest frame to a shared file so viewer panes in other tmux
+    windows can render it. Atomic via os.replace — readers either see the
+    previous file or the new one, never a torn write.
+
+    Failures are swallowed: a missing or unwritable state dir must never kill
+    the render loop.
+    """
+    try:
+        tmp = FRAME_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, FRAME_PATH)
+    except Exception:
         pass
 
 
@@ -183,8 +202,10 @@ def main() -> int:
                 choreo.render(canvas, bpm, detector.last_rms, now)
 
                 frame = canvas.render_ansi()
+                payload = "\x1b[H" + frame
+                _mirror_frame(payload)
                 try:
-                    sys.stdout.write("\x1b[H" + frame)
+                    sys.stdout.write(payload)
                     sys.stdout.flush()
                 except (BrokenPipeError, OSError) as e:
                     # tty briefly unavailable (e.g. tmux re-layout) — back off
