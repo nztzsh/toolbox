@@ -46,17 +46,51 @@ MSG
   exit 3
 fi
 
-# inside a tmux session?
-if [ -z "${TMUX:-}" ]; then
+# Resolve the origin pane (where the dancer should appear). Normally we run
+# inside tmux and use the current pane. But Claude Code agents / background
+# jobs spawn shells that don't inherit $TMUX even when the user's Claude pane
+# lives in tmux — so fall back to asking the tmux server for the most
+# recently active attached client and use its active pane. An explicit
+# DANCING_CLAUDE_PANE=<pane-id> overrides both.
+resolve_origin_pane() {
+  if [ -n "${DANCING_CLAUDE_PANE:-}" ]; then
+    printf '%s\n' "$DANCING_CLAUDE_PANE"
+    return 0
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    tmux display-message -p '#{pane_id}'
+    return 0
+  fi
+  # outside tmux: most recently active attached client's active pane
+  local client
+  client="$(tmux list-clients -F '#{client_activity} #{client_tty}' 2>/dev/null \
+      | sort -rn | awk 'NR==1{print $2}')"
+  if [ -n "$client" ]; then
+    tmux display-message -p -c "$client" '#{pane_id}'
+    return 0
+  fi
+  # no attached client: most recently attached session's active pane
+  local session
+  session="$(tmux list-sessions -F '#{session_last_attached} #{session_id}' 2>/dev/null \
+      | sort -rn | awk 'NR==1{print $2}')"
+  if [ -n "$session" ]; then
+    tmux display-message -p -t "$session" '#{pane_id}'
+    return 0
+  fi
+  return 1
+}
+
+if ! ORIGIN_PANE="$(resolve_origin_pane)" || [ -z "$ORIGIN_PANE" ]; then
   cat >&2 <<'MSG'
-error: not inside a tmux session.
+error: no tmux session found.
 
   tmux new -s claude        # start a session
   claude                    # run Claude Code in it
-  ./bin/start.sh            # then run this from another pane in the same session
+  ./bin/start.sh            # then run this (any shell on this machine works —
+                            # the script finds the attached tmux client itself)
 
-The dancer lives in a pane of the *current* tmux session, which is why this
-shell has to be inside tmux too.
+The dancer lives in a pane of a running tmux session, so the tmux server must
+have at least one session.
 MSG
   exit 4
 fi
@@ -111,10 +145,10 @@ fi
 # clear any stale frame from a previous run
 rm -f "$FRAME_FILE" "$FRAME_FILE.tmp"
 
-# capture origin pane (where the user invoked us, i.e. Claude Code)
-ORIGIN_PANE="$(tmux display-message -p '#{pane_id}')"
-ORIGIN_WINDOW="$(tmux display-message -p '#{window_id}')"
-ORIGIN_SESSION="$(tmux display-message -p '#{session_id}')"
+# derive window/session from the origin pane (resolved above; works whether
+# or not this shell itself is inside tmux)
+ORIGIN_WINDOW="$(tmux display-message -p -t "$ORIGIN_PANE" '#{window_id}')"
+ORIGIN_SESSION="$(tmux display-message -p -t "$ORIGIN_PANE" '#{session_id}')"
 
 # style separator to blend. We apply window-scoped (-w) settings per window
 # because each window needs them independently. apply_border_style is reused
